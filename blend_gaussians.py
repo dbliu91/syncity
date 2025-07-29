@@ -18,6 +18,7 @@ from tile_cutting import z_preserving_crop
 from trellis.pipelines import TrellisImageTo3DPipeline
 from trellis.representations.gaussian import Gaussian
 from trellis.utils import render_utils
+from trellis.utils import postprocessing_utils
 
 def generate_tile_info(blender_path: str, grid: List[Dict], output_folder: str, resolution: int = 1024):
     print("Generating tile info... ", end='', flush=True)
@@ -284,6 +285,82 @@ def structure_preserving_interpolation(voxels, scale_factor, method='nearest_the
         resized = resized.squeeze(0)  # [D, H, W]
         
     return resized
+
+def gaussian_to_glb(gaussian: Gaussian, output_path: str, simplify: float = 0.95, texture_size: int = 1024):
+    """
+    Convert a Gaussian representation to a GLB file.
+    
+    Args:
+        gaussian (Gaussian): The Gaussian representation to convert
+        output_path (str): Path where to save the GLB file
+        simplify (float): Ratio of triangles to remove in simplification
+        texture_size (int): Size of the texture used for the GLB
+    """
+    try:
+        # Get the gaussian positions
+        xyz = gaussian.get_xyz.cpu().numpy()
+        
+        if len(xyz) == 0:
+            print(f"Warning: No gaussian points found for GLB export to {output_path}")
+            return
+            
+        # Import required libraries
+        from scipy.spatial import Delaunay
+        import trimesh
+        
+        # Project to 2D for triangulation (using x and y coordinates)
+        points_2d = xyz[:, :2]
+        
+        try:
+            # Create triangulation
+            tri = Delaunay(points_2d)
+            faces = tri.simplices
+            
+            # Create vertices from the 3D points
+            vertices = xyz
+            
+            # Create a simple mesh
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+            
+            # Create a simple material
+            material = trimesh.visual.material.PBRMaterial(
+                roughnessFactor=1.0,
+                baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8)
+            )
+            
+            # Apply material to mesh
+            mesh.visual = trimesh.visual.TextureVisuals(material=material)
+            
+            # Export as GLB
+            mesh.export(output_path)
+            print(f"GLB file saved to: {output_path}")
+            
+        except Exception as e:
+            print(f"Error creating mesh from gaussians: {e}")
+            # Fallback: create a simple point cloud as GLB
+            try:
+                # Create a simple sphere mesh as fallback
+                sphere = trimesh.creation.icosphere(subdivisions=2, radius=0.01)
+                sphere.visual.face_colors = [255, 255, 255, 255]
+                
+                # Position spheres at gaussian centers
+                meshes = []
+                for point in xyz[:1000]:  # Limit to first 1000 points to avoid too many meshes
+                    sphere_copy = sphere.copy()
+                    sphere_copy.apply_translation(point)
+                    meshes.append(sphere_copy)
+                
+                # Combine all meshes
+                combined_mesh = trimesh.util.concatenate(meshes)
+                combined_mesh.export(output_path)
+                print(f"Fallback GLB file saved to: {output_path}")
+                
+            except Exception as e2:
+                print(f"Error creating fallback GLB: {e2}")
+                
+    except Exception as e:
+        print(f"Error in gaussian_to_glb: {e}")
+        print(f"GLB export failed for {output_path}")
 
 def get_mask(image, pts = (0.4, 0.48, 0.75, 0.49)):
     from PIL import ImageDraw
@@ -569,6 +646,12 @@ def merge_gaussians(
         video = render_utils.render_video(scene_vanilla, num_frames=300, resolution=2048, r=max_extent*2.5)['color']
         imageio.mimsave(os.path.join(grid_path, "gaussians.mp4"), video, fps=30)
 
+        # Export GLB file for the vanilla scene
+        try:
+            gaussian_to_glb(scene_vanilla, os.path.join(grid_path, "gaussians.glb"))
+        except Exception as e:
+            print(f"Failed to export vanilla GLB: {e}")
+
         del scene_vanilla
 
         torch.cuda.empty_cache()
@@ -715,6 +798,12 @@ def merge_gaussians(
 
         video = render_utils.render_video(scene, num_frames=300, resolution=2048, r=int(max_extent*2.5), pitch_mean=0.3, pitch_offset=0.15, bg_color=(1,1,1))['color']
         imageio.mimsave(f'{grid_path}/gaussians_blended.mp4', video, fps=30)
+
+        # Export GLB file for the blended scene
+        try:
+            gaussian_to_glb(scene, f'{grid_path}/gaussians_blended.glb')
+        except Exception as e:
+            print(f"Failed to export blended GLB: {e}")
 
 if __name__ == '__main__':
     import fire
