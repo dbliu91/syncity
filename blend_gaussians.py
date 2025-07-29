@@ -18,6 +18,75 @@ from tile_cutting import z_preserving_crop
 from trellis.pipelines import TrellisImageTo3DPipeline
 from trellis.representations.gaussian import Gaussian
 from trellis.utils import render_utils
+from trellis.utils import postprocessing_utils
+
+def export_gaussian_to_glb(gaussian, mesh, output_path, simplify=0.95, texture_size=1024):
+    """
+    Export a Gaussian representation with mesh to GLB format.
+    
+    Args:
+        gaussian: Gaussian representation
+        mesh: Mesh data (MeshExtractResult)
+        output_path: Path to save the GLB file
+        simplify: Simplification ratio (0-1)
+        texture_size: Texture size for the GLB
+    """
+    try:
+        # Use postprocessing_utils to convert to GLB
+        glb = postprocessing_utils.to_glb(
+            gaussian,
+            mesh,
+            simplify=simplify,
+            texture_size=texture_size,
+            verbose=False
+        )
+        glb.export(output_path)
+        print(f"Exported GLB to {output_path}")
+        return glb
+    except Exception as e:
+        print(f"Error exporting GLB: {e}")
+        return None
+
+def combine_meshes(meshes, translations):
+    """
+    Combine multiple meshes into a single mesh by translating and merging vertices/faces.
+    
+    Args:
+        meshes: List of MeshExtractResult objects
+        translations: List of (x, y, z) translation tuples
+    
+    Returns:
+        Combined MeshExtractResult
+    """
+    import trimesh
+    from trellis.representations import MeshExtractResult
+    
+    combined_mesh = None
+    
+    for mesh, translation in zip(meshes, translations):
+        # Create trimesh object
+        vertices = mesh.vertices.cpu().numpy()
+        faces = mesh.faces.cpu().numpy()
+        
+        # Apply translation
+        vertices = vertices + np.array(translation)
+        
+        # Create trimesh
+        tm = trimesh.Trimesh(vertices=vertices, faces=faces)
+        
+        if combined_mesh is None:
+            combined_mesh = tm
+        else:
+            combined_mesh = trimesh.util.concatenate([combined_mesh, tm])
+    
+    # Convert back to MeshExtractResult format
+    result = MeshExtractResult(
+        vertices=torch.tensor(combined_mesh.vertices, dtype=torch.float32),
+        faces=torch.tensor(combined_mesh.faces, dtype=torch.int32),
+        vertex_attrs={}
+    )
+    
+    return result
 
 def generate_tile_info(blender_path: str, grid: List[Dict], output_folder: str, resolution: int = 1024):
     print("Generating tile info... ", end='', flush=True)
@@ -306,36 +375,58 @@ def get_mask(image, pts = (0.4, 0.48, 0.75, 0.49)):
 
     return mask
 
-def sample_slat(voxels_grid, views, pipeline, render_video=False):
+def sample_slat(voxels_grid, views, pipeline, render_video=False, decode_mesh=True):
     if len(voxels_grid.shape) == 3:
         voxels_grid = voxels_grid.unsqueeze(0).unsqueeze(0)
     coords = torch.argwhere(voxels_grid > 0)[:, [0, 2, 3, 4]].int()
     cond = process_images_for_pipeline(views, pipeline)
     cond['neg_cond'] = cond['neg_cond'][:1]
     slat, slat_raw = pipeline.sample_slat_multi_image(coords.cuda(), cond)
-    gs = pipeline.decode_slat(slat, ['gaussian'])
-    gs = gs['gaussian'][0]
+    
+    # Decode to both gaussian and mesh formats
+    decode_formats = ['gaussian']
+    if decode_mesh:
+        decode_formats.append('mesh')
+    
+    decoded = pipeline.decode_slat(slat, decode_formats)
+    gs = decoded['gaussian'][0]
+    
     output = {
         'slat' : slat,
         'slat_raw' : slat_raw,
         'gs' : gs
     }
+    
+    if decode_mesh and 'mesh' in decoded:
+        output['mesh'] = decoded['mesh'][0]
+    
     if render_video:
         video = render_utils.render_video(gs, num_frames=300, resolution=512, r=2)['color']
         output['video'] = video
     return output
 
-def sample_slat_cond(views, pipeline, cond_slat, cond_slat_mask, render_video=False):
+def sample_slat_cond(views, pipeline, cond_slat, cond_slat_mask, render_video=False, decode_mesh=True):
     cond = process_images_for_pipeline(views, pipeline)
     cond['neg_cond'] = cond['neg_cond'][:1]
     slat, slat_raw = pipeline.sample_slat_multi_image(cond_slat.coords, cond, {}, cond_samples=cond_slat, cond_samples_mask=cond_slat_mask)
-    gs = pipeline.decode_slat(slat, ['gaussian'])
-    gs = gs['gaussian'][0]
+    
+    # Decode to both gaussian and mesh formats
+    decode_formats = ['gaussian']
+    if decode_mesh:
+        decode_formats.append('mesh')
+    
+    decoded = pipeline.decode_slat(slat, decode_formats)
+    gs = decoded['gaussian'][0]
+    
     output = {
         'slat' : slat,
         'slat_raw' : slat_raw,
         'gs' : gs
     }
+    
+    if decode_mesh and 'mesh' in decoded:
+        output['mesh'] = decoded['mesh'][0]
+    
     if render_video:
         video = render_utils.render_video(gs, num_frames=300, resolution=512, r=2)['color']
         output['video'] = video
@@ -463,12 +554,18 @@ def get_rescaled_cropped_slat(tile, views, z, pipeline, ss_decoder):
 
     output_full = sample_slat_cond(views, pipeline, slat_cond_full, slat_cond_full_mask)
 
-    return {
+    result = {
         'voxels' : voxels_grid,
         'slat' : output_full['slat'],
         'slat_raw' : output_full['slat_raw'],
         'gs' : output_full['gs']
     }
+    
+    # Include mesh if available
+    if 'mesh' in output_full:
+        result['mesh'] = output_full['mesh']
+    
+    return result
 
 @torch.no_grad()
 def merge_gaussians(
@@ -479,11 +576,12 @@ def merge_gaussians(
         use_cached: bool = False,
         gradio_url='http://127.0.0.1:7860',
         blender_path: str = 'blender-3.6.19-linux-x64/blender',
-        seed: int = 429
+        seed: int = 429,
+        export_glb: bool = True  # Add parameter to control GLB export
     ):
 
     grid_path = prefix
-    print(f'Options are compute_rescaled={compute_rescaled}, stitch_images={stitch_images}, stitch_slats={stitch_slats}')
+    print(f'Options are compute_rescaled={compute_rescaled}, stitch_images={stitch_images}, stitch_slats={stitch_slats}, export_glb={export_glb}')
     grid_info_path = os.path.join(grid_path, 'grid.json')
 
     grid_info = json.load(open(grid_info_path))
@@ -525,6 +623,9 @@ def merge_gaussians(
     pipeline.cuda()
 
     rescaled_tiles = {}
+    vanilla_meshes = []  # Collect meshes for vanilla scene
+    vanilla_translations = []  # Collect translations for vanilla scene
+    
     from copy import deepcopy
     if compute_rescaled:
         for tile in tqdm(grid_info, desc="Computing rescaled tiles..."):
@@ -539,6 +640,11 @@ def merge_gaussians(
             g_ = deepcopy(rescaled_tiles[f'{x}_{y}']['gs'])
             video = render_utils.render_video(g_, num_frames=50, resolution=512)['color']
             imageio.mimsave(f'{grid_path}/{x},{y}/recon.mp4', video, fps=5)
+
+            # Collect mesh data if available
+            if 'mesh' in rescaled_tiles[f'{x}_{y}'] and export_glb:
+                vanilla_meshes.append(rescaled_tiles[f'{x}_{y}']['mesh'])
+                vanilla_translations.append((x - center_x, y - center_y, 0))
 
             g.translate((x - center_x, y - center_y, 0))
 
@@ -568,6 +674,30 @@ def merge_gaussians(
 
         video = render_utils.render_video(scene_vanilla, num_frames=300, resolution=2048, r=max_extent*2.5)['color']
         imageio.mimsave(os.path.join(grid_path, "gaussians.mp4"), video, fps=30)
+        
+        # Export vanilla scene as GLB if requested
+        if export_glb:
+            # Save the gaussian PLY file
+            scene_vanilla.save_ply(os.path.join(grid_path, "gaussians.ply"), transform=None)
+            print(f"Saved Gaussian PLY file to {os.path.join(grid_path, 'gaussians.ply')}")
+            
+            # Try to create GLB if we have mesh data
+            if vanilla_meshes:
+                try:
+                    print("Combining meshes for vanilla scene GLB...")
+                    combined_mesh = combine_meshes(vanilla_meshes, vanilla_translations)
+                    export_gaussian_to_glb(
+                        scene_vanilla, 
+                        combined_mesh, 
+                        os.path.join(grid_path, "gaussians.glb"),
+                        simplify=0.95,
+                        texture_size=1024
+                    )
+                except Exception as e:
+                    print(f"Failed to create vanilla scene GLB: {e}")
+            else:
+                print("No mesh data available for vanilla scene GLB export.")
+                print("To generate GLB files, ensure the pipeline generates mesh data by using decode_mesh=True")
 
         del scene_vanilla
 
@@ -626,6 +756,9 @@ def merge_gaussians(
                 inpainted.save(f'{grid_path}/{x},{y}/stitch_to_{direction}_inpainted.png')
     
     scene = None
+    blended_meshes = []  # Collect meshes for blended scene
+    blended_translations = []  # Collect translations for blended scene
+    
     BORDER = 4
     CUT = 0
     FRAC_TILE = 1.5
@@ -654,6 +787,17 @@ def merge_gaussians(
             g.translate((x - center_x, y - center_y, 0))
             g.translate((- 2 * x * CUT  / GRID, - 2 * y * CUT / GRID, 0))
             
+            # Collect mesh data from main tile if available
+            if export_glb and 'mesh' in rescaled_tiles[f'{x}_{y}']:
+                tile_mesh = rescaled_tiles[f'{x}_{y}']['mesh']
+                tile_translation = (
+                    (x - center_x) - 2 * x * CUT / GRID,
+                    (y - center_y) - 2 * y * CUT / GRID,
+                    0
+                )
+                blended_meshes.append(tile_mesh)
+                blended_translations.append(tile_translation)
+            
             if scene is None:
                 scene = deepcopy(g)
             else:
@@ -673,7 +817,16 @@ def merge_gaussians(
                     with torch.no_grad():
                         cond = process_images_for_pipeline(cond_image, pipeline, fake_alpha=True, uncond=UNCOND)
                         slat, slat_raw = pipeline.sample_slat(cond, slat_combined.coords, {}, slat_combined, slat_mask)
-                        output_gs = pipeline.decode_slat(slat, ['gaussian'])['gaussian'][0]
+                        # Decode both gaussian and mesh if GLB export is requested
+                        decode_formats = ['gaussian']
+                        if export_glb:
+                            decode_formats.append('mesh')
+                        decoded = pipeline.decode_slat(slat, decode_formats)
+                        output_gs = decoded['gaussian'][0]
+                        
+                        # Store mesh if available
+                        if export_glb and 'mesh' in decoded:
+                            output_mesh = decoded['mesh'][0]
                     output_gs.save_ply(f'{grid_path}/{x},{y}/stitch_to_{direction}_slat.ply', transform=None)
 
                 if direction == 'x':
@@ -697,6 +850,14 @@ def merge_gaussians(
                     - (2 * y ) * CUT / 64 if direction == 'y' else - (2 * y + 1) * CUT / 64,
                     0))
                 
+                # Collect mesh data if available
+                if export_glb and 'mesh' in locals() and 'output_mesh' in locals():
+                    # Calculate total translation for the mesh
+                    total_translate_x = translate_x + (x - center_x) - ((2 * x) * CUT / 64 if direction == 'x' else (2 * x + 1) * CUT / 64)
+                    total_translate_y = translate_y + (y - center_y) - ((2 * y) * CUT / 64 if direction == 'y' else (2 * y + 1) * CUT / 64)
+                    blended_meshes.append(output_mesh)
+                    blended_translations.append((total_translate_x, total_translate_y, 0))
+                
                 scene.combine([output_gs])
    
                 torch.cuda.empty_cache()
@@ -715,6 +876,28 @@ def merge_gaussians(
 
         video = render_utils.render_video(scene, num_frames=300, resolution=2048, r=int(max_extent*2.5), pitch_mean=0.3, pitch_offset=0.15, bg_color=(1,1,1))['color']
         imageio.mimsave(f'{grid_path}/gaussians_blended.mp4', video, fps=30)
+        
+        # Export blended scene as GLB if requested
+        if export_glb:
+            print(f"Saved blended Gaussian PLY file to {grid_path}/gaussians_scene.ply")
+            
+            # Try to create GLB if we have mesh data
+            if blended_meshes:
+                try:
+                    print("Combining meshes for blended scene GLB...")
+                    combined_blended_mesh = combine_meshes(blended_meshes, blended_translations)
+                    export_gaussian_to_glb(
+                        scene,
+                        combined_blended_mesh,
+                        os.path.join(grid_path, "gaussians_blended.glb"),
+                        simplify=0.95,
+                        texture_size=1024
+                    )
+                except Exception as e:
+                    print(f"Failed to create blended scene GLB: {e}")
+            else:
+                print("No mesh data available for blended scene GLB export.")
+                print("To generate GLB files, ensure the pipeline generates mesh data.")
 
 if __name__ == '__main__':
     import fire
