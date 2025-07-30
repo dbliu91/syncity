@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import gc
 from typing import Dict, List
 
 os.environ['ATTN_BACKEND'] = 'xformers'
@@ -20,7 +21,7 @@ from trellis.representations.gaussian import Gaussian
 from trellis.utils import render_utils
 from trellis.utils import postprocessing_utils
 
-def export_gaussian_to_glb(gaussian, mesh, output_path, simplify=0.95, texture_size=1024):
+def export_gaussian_to_glb(gaussian, mesh, output_path, simplify=0.98, texture_size=512, max_mesh_faces=None):
     """
     Export a Gaussian representation with mesh to GLB format.
     
@@ -28,32 +29,71 @@ def export_gaussian_to_glb(gaussian, mesh, output_path, simplify=0.95, texture_s
         gaussian: Gaussian representation
         mesh: Mesh data (MeshExtractResult)
         output_path: Path to save the GLB file
-        simplify: Simplification ratio (0-1)
-        texture_size: Texture size for the GLB
+        simplify: Simplification ratio (0-1), default 0.98 for more aggressive simplification
+        texture_size: Texture size for the GLB, default 512 to reduce memory usage
+        max_mesh_faces: Optional maximum faces before export (will further simplify if needed)
     """
     try:
+        # Pre-check mesh size and simplify if necessary
+        if max_mesh_faces is not None and mesh.faces.shape[0] > max_mesh_faces:
+            print(f"Warning: Mesh has {mesh.faces.shape[0]} faces, exceeding limit of {max_mesh_faces}")
+            print(f"Will use higher simplification to reduce face count...")
+            # Calculate more aggressive simplification ratio
+            target_simplify = max_mesh_faces / mesh.faces.shape[0]
+            simplify = min(simplify, target_simplify)
+            print(f"Using simplification ratio: {simplify:.3f}")
+        
+        print(f"Exporting GLB with {mesh.faces.shape[0]} faces, simplify={simplify:.3f}, texture_size={texture_size}")
+        
         # Use postprocessing_utils to convert to GLB
         glb = postprocessing_utils.to_glb(
             gaussian,
             mesh,
             simplify=simplify,
             texture_size=texture_size,
-            verbose=False
+            verbose=True  # Enable verbose to monitor progress
         )
         glb.export(output_path)
         print(f"Exported GLB to {output_path}")
+        
+        # Clean up memory after export
+        torch.cuda.empty_cache()
+        gc.collect()
+        
         return glb
     except Exception as e:
         print(f"Error exporting GLB: {e}")
+        # Try with more aggressive settings if first attempt fails
+        if simplify < 0.99:
+            print("Retrying with more aggressive simplification...")
+            try:
+                glb = postprocessing_utils.to_glb(
+                    gaussian,
+                    mesh,
+                    simplify=0.99,  # Very aggressive simplification
+                    texture_size=256,  # Much smaller texture
+                    verbose=True
+                )
+                                 glb.export(output_path)
+                 print(f"Exported GLB to {output_path} with aggressive settings")
+                 
+                 # Clean up memory after export
+                 torch.cuda.empty_cache()
+                 gc.collect()
+                 
+                 return glb
+            except Exception as e2:
+                print(f"Failed even with aggressive settings: {e2}")
         return None
 
-def combine_meshes(meshes, translations):
+def combine_meshes(meshes, translations, max_faces=50000):
     """
     Combine multiple meshes into a single mesh by translating and merging vertices/faces.
     
     Args:
         meshes: List of MeshExtractResult objects
         translations: List of (x, y, z) translation tuples
+        max_faces: Maximum number of faces allowed in the combined mesh (default: 50000)
     
     Returns:
         Combined MeshExtractResult
@@ -62,8 +102,24 @@ def combine_meshes(meshes, translations):
     from trellis.representations import MeshExtractResult
     
     combined_mesh = None
+    total_faces = 0
+    processed_meshes = 0
     
-    for mesh, translation in zip(meshes, translations):
+    # First pass: calculate total faces and estimate simplification needed
+    total_original_faces = sum(mesh.faces.shape[0] for mesh in meshes)
+    
+    print(f"Combining {len(meshes)} meshes with total {total_original_faces} faces (limit: {max_faces})")
+    
+    # If total faces exceed limit, pre-simplify individual meshes
+    if total_original_faces > max_faces:
+        # Calculate simplification ratio to reduce each mesh proportionally
+        simplify_ratio = max_faces / total_original_faces
+        simplify_ratio = max(0.1, min(0.95, simplify_ratio))  # Clamp between 0.1 and 0.95
+        print(f"Pre-simplifying meshes with ratio: {simplify_ratio:.3f}")
+    else:
+        simplify_ratio = None
+    
+    for i, (mesh, translation) in enumerate(zip(meshes, translations)):
         # Create trimesh object
         vertices = mesh.vertices.cpu().numpy()
         faces = mesh.faces.cpu().numpy()
@@ -74,10 +130,46 @@ def combine_meshes(meshes, translations):
         # Create trimesh
         tm = trimesh.Trimesh(vertices=vertices, faces=faces)
         
+        # Pre-simplify if necessary
+        if simplify_ratio is not None and tm.faces.shape[0] > 100:  # Only simplify if mesh has enough faces
+            try:
+                # Use trimesh's built-in simplification
+                tm = tm.simplify_quadric_decimation(int(tm.faces.shape[0] * simplify_ratio))
+            except Exception as e:
+                print(f"Warning: Could not simplify mesh {i}: {e}")
+        
+        # Check if adding this mesh would exceed the face limit
+        mesh_faces = tm.faces.shape[0]
+        if total_faces + mesh_faces > max_faces:
+            remaining_faces = max_faces - total_faces
+            if remaining_faces > 100:  # Only add if we can fit at least 100 faces
+                try:
+                    # Further simplify this mesh to fit remaining budget
+                    reduction_ratio = remaining_faces / mesh_faces
+                    tm = tm.simplify_quadric_decimation(remaining_faces)
+                    mesh_faces = tm.faces.shape[0]
+                    print(f"Mesh {i} simplified to {mesh_faces} faces to fit remaining budget")
+                except Exception as e:
+                    print(f"Warning: Could not fit mesh {i} in remaining face budget: {e}")
+                    break
+            else:
+                print(f"Stopping at mesh {i}: insufficient face budget remaining ({remaining_faces})")
+                break
+        
         if combined_mesh is None:
             combined_mesh = tm
         else:
             combined_mesh = trimesh.util.concatenate([combined_mesh, tm])
+        
+        total_faces += mesh_faces
+        processed_meshes += 1
+        
+        # Safety check
+        if total_faces >= max_faces:
+            print(f"Reached maximum face limit. Processed {processed_meshes}/{len(meshes)} meshes.")
+            break
+    
+    print(f"Final combined mesh: {combined_mesh.vertices.shape[0]} vertices, {combined_mesh.faces.shape[0]} faces")
     
     # Convert back to MeshExtractResult format
     result = MeshExtractResult(
@@ -85,6 +177,10 @@ def combine_meshes(meshes, translations):
         faces=torch.tensor(combined_mesh.faces, dtype=torch.int32),
         vertex_attrs={}
     )
+    
+    # Clean up memory
+    del combined_mesh
+    gc.collect()
     
     return result
 
@@ -685,13 +781,14 @@ def merge_gaussians(
             if vanilla_meshes:
                 try:
                     print("Combining meshes for vanilla scene GLB...")
-                    combined_mesh = combine_meshes(vanilla_meshes, vanilla_translations)
+                    combined_mesh = combine_meshes(vanilla_meshes, vanilla_translations, max_faces=50000)
                     export_gaussian_to_glb(
                         scene_vanilla, 
                         combined_mesh, 
                         os.path.join(grid_path, "gaussians.glb"),
-                        simplify=0.95,
-                        texture_size=1024
+                        simplify=0.98,
+                        texture_size=512,
+                        max_mesh_faces=30000
                     )
                 except Exception as e:
                     print(f"Failed to create vanilla scene GLB: {e}")
@@ -885,13 +982,14 @@ def merge_gaussians(
             if blended_meshes:
                 try:
                     print("Combining meshes for blended scene GLB...")
-                    combined_blended_mesh = combine_meshes(blended_meshes, blended_translations)
+                    combined_blended_mesh = combine_meshes(blended_meshes, blended_translations, max_faces=50000)
                     export_gaussian_to_glb(
                         scene,
                         combined_blended_mesh,
                         os.path.join(grid_path, "gaussians_blended.glb"),
-                        simplify=0.95,
-                        texture_size=1024
+                        simplify=0.98,
+                        texture_size=512,
+                        max_mesh_faces=30000
                     )
                 except Exception as e:
                     print(f"Failed to create blended scene GLB: {e}")
