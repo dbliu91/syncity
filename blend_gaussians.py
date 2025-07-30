@@ -133,8 +133,16 @@ def combine_meshes(meshes, translations, max_faces=50000):
         # Pre-simplify if necessary
         if simplify_ratio is not None and tm.faces.shape[0] > 100:  # Only simplify if mesh has enough faces
             try:
-                # Use trimesh's built-in simplification
-                tm = tm.simplify_quadric_decimation(int(tm.faces.shape[0] * simplify_ratio))
+                # Calculate target face count from ratio
+                target_faces = max(100, int(tm.faces.shape[0] * simplify_ratio))
+                # Use face_count parameter instead of ratio-based calculation
+                simplified_tm = tm.simplify_quadric_decimation(face_count=target_faces)
+                # Check if simplification succeeded
+                if simplified_tm is not None and hasattr(simplified_tm, 'vertices') and hasattr(simplified_tm, 'faces'):
+                    tm = simplified_tm
+                    print(f"Mesh {i} simplified from {mesh.faces.shape[0]} to {tm.faces.shape[0]} faces")
+                else:
+                    print(f"Warning: Simplification failed for mesh {i}, using original mesh")
             except Exception as e:
                 print(f"Warning: Could not simplify mesh {i}: {e}")
         
@@ -145,10 +153,15 @@ def combine_meshes(meshes, translations, max_faces=50000):
             if remaining_faces > 100:  # Only add if we can fit at least 100 faces
                 try:
                     # Further simplify this mesh to fit remaining budget
-                    reduction_ratio = remaining_faces / mesh_faces
-                    tm = tm.simplify_quadric_decimation(remaining_faces)
-                    mesh_faces = tm.faces.shape[0]
-                    print(f"Mesh {i} simplified to {mesh_faces} faces to fit remaining budget")
+                    simplified_tm = tm.simplify_quadric_decimation(face_count=remaining_faces)
+                    # Check if simplification succeeded
+                    if simplified_tm is not None and hasattr(simplified_tm, 'vertices') and hasattr(simplified_tm, 'faces'):
+                        tm = simplified_tm
+                        mesh_faces = tm.faces.shape[0]
+                        print(f"Mesh {i} simplified to {mesh_faces} faces to fit remaining budget")
+                    else:
+                        print(f"Warning: Could not fit mesh {i} in remaining face budget: simplification returned None")
+                        break
                 except Exception as e:
                     print(f"Warning: Could not fit mesh {i} in remaining face budget: {e}")
                     break
@@ -156,10 +169,20 @@ def combine_meshes(meshes, translations, max_faces=50000):
                 print(f"Stopping at mesh {i}: insufficient face budget remaining ({remaining_faces})")
                 break
         
+        # Verify that tm is still valid before combining
+        if tm is None or not hasattr(tm, 'vertices') or not hasattr(tm, 'faces'):
+            print(f"Warning: Mesh {i} is invalid after processing, skipping")
+            continue
+            
         if combined_mesh is None:
             combined_mesh = tm
         else:
-            combined_mesh = trimesh.util.concatenate([combined_mesh, tm])
+            # Use trimesh concatenate which handles the combination properly
+            try:
+                combined_mesh = trimesh.util.concatenate([combined_mesh, tm])
+            except Exception as e:
+                print(f"Warning: Could not concatenate mesh {i}: {e}")
+                break
         
         total_faces += mesh_faces
         processed_meshes += 1
@@ -168,6 +191,10 @@ def combine_meshes(meshes, translations, max_faces=50000):
         if total_faces >= max_faces:
             print(f"Reached maximum face limit. Processed {processed_meshes}/{len(meshes)} meshes.")
             break
+    
+    # Final check to ensure we have a valid combined mesh
+    if combined_mesh is None or not hasattr(combined_mesh, 'vertices') or not hasattr(combined_mesh, 'faces'):
+        raise ValueError("Failed to create combined mesh: all meshes were invalid or simplification failed")
     
     print(f"Final combined mesh: {combined_mesh.vertices.shape[0]} vertices, {combined_mesh.faces.shape[0]} faces")
     
