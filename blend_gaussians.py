@@ -672,6 +672,18 @@ def merge_gaussians(
 
         torch.cuda.empty_cache()
 
+        # Save vanilla scene to PLY and convert to GLB
+        vanilla_ply_path = os.path.join(grid_path, "gaussians.ply")
+        scene_vanilla.save_ply(vanilla_ply_path, transform=None)
+
+        # Convert to GLB – fall back gracefully if conversion fails
+        try:
+            import trimesh
+            mesh = trimesh.load(vanilla_ply_path, process=False)
+            mesh.export(os.path.join(grid_path, "gaussians.glb"))
+        except Exception as e:
+            print(f"[WARN] Failed to convert vanilla scene to GLB: {e}")
+
         video = render_utils.render_video(scene_vanilla, num_frames=300, resolution=2048, r=max_extent*2.5)['color']
         imageio.mimsave(os.path.join(grid_path, "gaussians.mp4"), video, fps=30)
         
@@ -872,7 +884,16 @@ def merge_gaussians(
         del pipeline
         torch.cuda.empty_cache()
 
-        scene.save_ply(f'{grid_path}/gaussians_scene.ply', transform=None)
+        # Save blended scene to PLY and convert to GLB
+        blended_ply_path = f'{grid_path}/gaussians_scene.ply'
+        scene.save_ply(blended_ply_path, transform=None)
+
+        try:
+            import trimesh
+            mesh = trimesh.load(blended_ply_path, process=False)
+            mesh.export(f'{grid_path}/gaussians_blended.glb')
+        except Exception as e:
+            print(f"[WARN] Failed to convert blended scene to GLB: {e}")
 
         video = render_utils.render_video(scene, num_frames=300, resolution=2048, r=int(max_extent*2.5), pitch_mean=0.3, pitch_offset=0.15, bg_color=(1,1,1))['color']
         imageio.mimsave(f'{grid_path}/gaussians_blended.mp4', video, fps=30)
